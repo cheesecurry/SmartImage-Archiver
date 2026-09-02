@@ -1,0 +1,131 @@
+name: Build SmartImage Archiver EXE
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Python関連のインストール
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: バージョン設定
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $version = "${{ github.ref_name }}" -replace '^v',''
+
+            # Windowsのバージョン形式(1.2.3.4)へ変換
+            $parts = $version.Split('.')
+
+            while ($parts.Count -lt 4) {
+              $parts += "0"
+            }
+
+            $version4 = ($parts[0..3] -join '.')
+          }
+          else {
+            $version = "0.0.0"
+            $version4 = "0.0.0.0"
+          }
+
+          echo "APP_VERSION=$version" >> $env:GITHUB_ENV
+          echo "APP_VERSION_WIN=$version4" >> $env:GITHUB_ENV
+
+      - name: 実行ファイル(.exe)の作成
+        shell: pwsh
+        run: |
+          python -m nuitka `
+            --standalone `
+            --onefile `
+            --windows-console-mode=force `
+            --remove-output `
+            --assume-yes-for-downloads `
+            --nofollow-import-to=scipy.integrate `
+            --nofollow-import-to=scipy.optimize `
+            --nofollow-import-to=scipy.signal `
+            --nofollow-import-to=scipy.sparse `
+            --nofollow-import-to=scipy.io `
+            --nofollow-import-to=skimage.data `
+            --nofollow-import-to=skimage.filters `
+            --nofollow-import-to=skimage.segmentation `
+            --nofollow-import-to=skimage.feature `
+            --nofollow-import-to=skimage.color `
+            --noinclude-data-files=skimage/data/* `
+            --output-filename="SmartImageArchiver.exe" `
+            --windows-product-name="SmartImageArchiver" `
+            --windows-file-version=$env:APP_VERSION_WIN `
+            --windows-product-version=$env:APP_VERSION_WIN `
+            SmartImage_Archiver.py
+
+      - name: Download UnRAR
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://www.rarlab.com/rar/unrarw64.exe" `
+            -OutFile "unrarw64.exe"
+
+      - name: Extract UnRAR
+        shell: pwsh
+        run: |
+          7z x .\unrarw64.exe -ounrar
+
+      - name: Check Inno Setup
+        id: iscc
+        shell: pwsh
+        run: |
+          if (Get-Command iscc -ErrorAction SilentlyContinue) {
+            echo "found=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "found=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Install Inno Setup
+        if: steps.iscc.outputs.found != 'true'
+        run: choco install innosetup -y
+
+      - name: インストーラーの作成
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ env.APP_VERSION }}
+        run: |
+          iscc installer.iss
+
+      - name: アウトプット
+        shell: pwsh
+        run: |
+          Copy-Item SmartImageArchiver.exe Output\SmartImageArchiver.exe
+
+      - name: Artifactsへアップロード
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartImageArchiver-Windows
+          path: Output
+          if-no-files-found: error
+
+      - name: GitHub Releaseへアップロード
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            Output/*.exe

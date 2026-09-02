@@ -1,0 +1,5 @@
+*.exe
+*.zip
+*.rar
+SmartImage_Archiver.*/*
+config.json

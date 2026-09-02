@@ -1,0 +1,7 @@
+rarfile
+py7zr
+Pillow
+tqdm
+scikit-image
+numpy
+nuitka
