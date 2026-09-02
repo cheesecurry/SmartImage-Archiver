@@ -1,7 +1,7 @@
 """
 SmartImage Archiver (Memory Optimized - RAM focus)
 """
-
+import sys
 import os
 import shutil
 import argparse
@@ -24,6 +24,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # =================================================================
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.avif'}
 CONFIG_FILENAME = "config.json"
+
 
 # =================================================================
 # 2. Utility Functions
@@ -254,14 +255,26 @@ def main():
 
     # Config loading logic
     config_ssim, config_workers = 90.0, None
-    config_path = Path(CONFIG_FILENAME)
+
+    # 1. 実行ファイル（またはスクリプト）が存在する絶対パスを取得
+    if getattr(sys, 'frozen', False) or hasattr(sys, '_MEIPASS'):
+        # .exeとして実行されている場合
+        base_dir = Path(os.path.dirname(sys.executable))
+    else:
+        # 通常の .py として実行されている場合
+        base_dir = Path(os.path.abspath(__file__)).parent
+
+    # 2. そのディレクトリ内の config.json を指定
+    config_path = base_dir / CONFIG_FILENAME
+
     if config_path.exists():
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, 'r', encoding='utf-8') as f:
                 config_data = json.load(f)
                 config_ssim = config_data.get("ssim", config_ssim)
                 config_workers = config_data.get("workers", config_workers)
-        except: pass
+        except Exception as e:
+            print(f"Warning: Failed to load {config_path.name} ({e}). Using defaults.")
 
     final_ssim = args.ssim if args.ssim is not None else config_ssim
     final_workers = args.workers if args.workers is not None else config_workers
