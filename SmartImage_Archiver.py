@@ -1,7 +1,6 @@
 """
 SmartImage Archiver (Memory Optimized - RAM focus)
 """
-import sys
 import os
 import shutil
 import argparse
@@ -256,13 +255,12 @@ def main():
     # Config loading logic
     config_ssim, config_workers = 90.0, None
 
-    # 1. 実行ファイル（またはスクリプト）が存在する絶対パスを取得
-    if getattr(sys, 'frozen', False) or hasattr(sys, '_MEIPASS'):
-        # .exeとして実行されている場合
-        base_dir = Path(os.path.dirname(sys.executable))
+    if "__compiled__" in globals():
+        # Nuitka
+        base_dir = Path(__compiled__.containing_dir)
     else:
-        # 通常の .py として実行されている場合
-        base_dir = Path(os.path.abspath(__file__)).parent
+        # Python実行（開発・テスト）
+        base_dir = Path(__file__).resolve().parent
 
     # 2. そのディレクトリ内の config.json を指定
     config_path = base_dir / CONFIG_FILENAME
