@@ -24,6 +24,14 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.avif'}
 CONFIG_FILENAME = "config.json"
 
+# Color definitions (ANSI escape sequences)
+COLOR_RED = "\033[91m"
+COLOR_RESET = "\033[0m"
+
+# Custom exception for missing RAR tools
+class RarToolMissingError(Exception):
+    """Raised when unrar.exe is not found in the system PATH or working directory."""
+    pass
 
 # =================================================================
 # 2. Utility Functions
@@ -82,20 +90,21 @@ def get_best_quality_for_format_logic(orig_img, fmt_name, target_ssim):
         except Exception:
             return None
 
-    # --- 【最適化】ショートカット・ロジック ---
+    stats_10 = get_stats(10)
+    if stats_10 is not None:
+        s10, z10, d10 = stats_10
+        if s10 >= target_ssim:
+            return {'path_data': d10, 'size': z10, 'score': s10, 'ext': ext, 'q': 10}
 
-    # 1. 最小値(q=10)でテスト: これで目標をクリアしていれば、これ以上調査する必要なし
-    s10, z10, d10 = get_stats(10)
-    if s10 is not None and s10 >= target_ssim:
-        return {'path_data': d10, 'size': z10, 'score': s10, 'ext': ext, 'q': 10}
-
-    # 2. 最大値(q=100)でテスト: これで目標に届かなければ、これ以上圧縮の余地なし
-    s100, z100, d100 = get_stats(100)
-    if s100 is None or s100 < target_ssim:
+    stats_100 = get_stats(100)
+    if stats_100 is None:
+        return None
+    
+    s100, z100, d100 = stats_100
+    if s100 < target_ssim:
         return {'path_data': d100, 'size': z100, 'score': s100, 'ext': ext, 'q': 100}
 
-    # 3. それ以外の場合のみ、二分探索を実行
-    low, high = 11, 99  # 10と100はテスト済みなので、その間を探索
+    low, high = 11, 99
     best_res = {'path_data': d100, 'size': z100, 'score': s100, 'ext': ext, 'q': 100}
 
     while low <= high:
@@ -123,8 +132,6 @@ def process_single_file_worker(file_path, rel_path, tmp_work_p, target_ssim, req
 
         for fmt in formats_to_test:
             res = get_best_quality_for_format_logic(orig_img, fmt, target_ssim)
-            # ここで `res` は「そのフォーマットにおける最終結果」のみ。
-            # 途中の試行データは `get_best_quality_for_format_logic` の中で破棄されている。
             if res and res['size'] < orig_size:
                 candidates.append(res)
 
@@ -146,7 +153,13 @@ def process_single_file_worker(file_path, rel_path, tmp_work_p, target_ssim, req
         return ("INFO", f"OK: {rel_path} -> {best['ext'].upper()} (Q={best['q']}, Size: {best['size']} bytes, SSIM={best['score']:.1f}, Reduction: {reduction:.2f}%)")
 
     except Exception as e:
-        return ("ERROR", f"ERR: {rel_path} ({str(e)})")
+        try:
+            dest = Path(tmp_work_p) / rel_path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file_path, dest)
+            return ("ERROR", f"ERR: {rel_path} ({str(e)}) - Copied original due to error")
+        except Exception as copy_e:
+            return ("ERROR", f"ERR: {rel_path} (Critical Error: {str(e)} | Copy Failed: {str(copy_e)})")
 
 # =================================================================
 # 4. Main Class
@@ -167,6 +180,7 @@ class Converter:
         input_path = Path(input_path)
         output_zip_path = Path(output_zip_path)
         orig_archive_size = input_path.stat().st_size
+        error_count = 0 
         
         with tempfile.TemporaryDirectory() as tmp_extract, \
              tempfile.TemporaryDirectory() as tmp_work:
@@ -181,8 +195,11 @@ class Converter:
                     zf.extractall(tmp_extract_p)
             elif detected_fmt == 'rar':
                 print(f"Extracting: {input_path.name}...")
-                with rarfile.RarFile(input_path) as rf:
-                    rf.extractall(tmp_extract_p)
+                try:
+                    with rarfile.RarFile(input_path) as rf:
+                        rf.extractall(tmp_extract_p)
+                except rarfile.RarCannotExec:
+                    raise RarToolMissingError("RAR extraction requires 'unrar.exe'.")
             elif detected_fmt == '7z':
                 print(f"Extracting: {input_path.name}...")
                 with py7zr.SevenZipFile(input_path, mode='r') as sz:
@@ -191,7 +208,8 @@ class Converter:
                 raise ValueError(f"Unsupported format: {detected_fmt}")
 
             all_files = [f for f in tmp_extract_p.rglob('*') if f.is_file()]
-            print(f"Processing {len(all_files)} files (Max Workers: {self.max_workers or 'All'})...")
+            
+            print(f"Processing {len(all_files)} files (Max Workers: {self.max_workers or 'All'}, Target SSIM: {self.target_ssim:.1f}%)...")
             
             tmp_work_p_str = str(tmp_work_p)
             
@@ -216,6 +234,7 @@ class Converter:
                     if res_level == "INFO":
                         self.logger.info(res_msg)
                     elif res_level == "ERROR":
+                        error_count += 1 
                         self.logger.error(res_msg)
                     else:
                         self.logger.info(res_msg)
@@ -234,11 +253,26 @@ class Converter:
 
             final_archive_size = output_zip_path.stat().st_size
             total_reduction_pct = ((orig_archive_size - final_archive_size) / orig_archive_size) * 100
-            summary = f"\n--- Summary ---\nOriginal: {orig_archive_size/1024/1024:.2f}MB | Output: {final_archive_size/1024/1024:.2f}MB | Reduction: {total_reduction_pct:.2f}%"
+            
+            error_display = f"Errors: {error_count}"
+            if error_count > 0:
+                error_display = f"{COLOR_RED}Errors: {error_count}{COLOR_RESET}"
+
+            summary = (f"\n--- Summary ---\n"
+                       f"Original: {orig_archive_size/1024/1024:.2f}MB | "
+                       f"Output: {final_archive_size/1024/1024:.2f}MB | "
+                       f"Reduction: {total_reduction_pct:.2f}% | "
+                       f"{error_display}\n")
+            
             self.logger.info(summary)
             print(summary)
+            
+            return error_count
 
 def main():
+    if os.name == 'nt':
+        os.system('')
+
     parser = argparse.ArgumentParser(description="SmartImage Archiver: High-fidelity, SSIM-optimized image archiver")
     parser.add_argument("input", help="Input archive file")
     parser.add_argument("--ssim", type=float, help="SSIM threshold")
@@ -252,17 +286,13 @@ def main():
         print(f"Error: File {input_file} not found.")
         return
 
-    # Config loading logic
     config_ssim, config_workers = 90.0, None
 
     if "__compiled__" in globals():
-        # Nuitka
         base_dir = Path(__compiled__.containing_dir)
     else:
-        # Python実行（開発・テスト）
         base_dir = Path(__file__).resolve().parent
 
-    # 2. そのディレクトリ内の config.json を指定
     config_path = base_dir / CONFIG_FILENAME
 
     if config_path.exists():
@@ -283,13 +313,24 @@ def main():
     log_file = input_file.parent / (input_file.stem + ".log")
     
     converter = Converter(final_ssim, log_file, args.format, final_workers)
+    
+    error_count = 0
     try:
-        converter.process_archive(input_file, output_file)
+        error_count = converter.process_archive(input_file, output_file)
         print(f"\nDone!")
+    except RarToolMissingError as e:
+        print(f"\n{COLOR_RED}Error: {str(e)}{COLOR_RESET}")
+        print("Please download 'unrar.exe' and place it in the same folder as this program.")
+        error_count = 1
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"\n{COLOR_RED}Error: {str(e)}{COLOR_RESET}")
         import traceback
         traceback.print_exc()
+        error_count = 1 
+
+    if error_count > 0:
+        print(f"\nFinished with {error_count} error(s).")
+        input("Press Enter to exit...")
 
 if __name__ == "__main__":
     main()
