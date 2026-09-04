@@ -68,19 +68,24 @@ def calculate_ssim_score(orig_arr, converted_img):
     score = ssim(orig_arr, img2_arr, channel_axis=-1)
     return score * 100
 
-def get_best_quality_for_format_logic(orig_img, fmt_name, target_ssim):
-    """Finds the minimum quality using binary search with early exit."""
+def get_best_quality_for_format_logic(orig_img, fmt_name, target_ssim, orig_size):
+    """Finds the minimum quality using binary search with 'Last Resort' high-fidelity check."""
     orig_rgb = orig_img.convert("RGB")
     orig_arr = np.asarray(orig_rgb)
-    ext = 'webp' if fmt_name == 'WEBP' else 'avif'
+    ext_map = {'WEBP': 'webp', 'AVIF': 'avif'}
+    ext = ext_map.get(fmt_name, 'webp')
     
-    def get_stats(q):
+    def get_stats(q, target_fmt, is_lossless=False, subsampling_val=None):
         buf = io.BytesIO()
         try:
-            if fmt_name == 'WEBP':
-                orig_img.save(buf, "WEBP", quality=q, lossless=False)
+            if target_fmt == 'WEBP':
+                # lossless=True のときは quality 引数は無視されるが、明示的に渡す
+                orig_img.save(buf, "WEBP", quality=q, lossless=is_lossless)
             else:
-                orig_img.save(buf, "AVIF", quality=q)
+                params = {"quality": q}
+                if subsampling_val:
+                    params["subsampling"] = subsampling_val
+                orig_img.save(buf, "AVIF", **params)
             buf.seek(0)
             with Image.open(buf) as comp_img:
                 score = calculate_ssim_score(orig_arr, comp_img)
@@ -90,48 +95,67 @@ def get_best_quality_for_format_logic(orig_img, fmt_name, target_ssim):
         except Exception:
             return None
 
-    stats_10 = get_stats(10)
-    if stats_10 is not None:
-        s10, z10, d10 = stats_10
-        if s10 >= target_ssim:
-            return {'path_data': d10, 'size': z10, 'score': s10, 'ext': ext, 'q': 10}
+    # 1. Check Q=10 for early exit
+    stats_10 = get_stats(10, fmt_name)
+    if stats_10 and stats_10[0] >= target_ssim and stats_10[1] < orig_size:
+        return {'path_data': stats_10[2], 'size': stats_10[1], 'score': stats_10[0], 'ext': ext, 'q_label': '10'}
 
-    stats_100 = get_stats(100)
+    # 2. Check Q=100
+    stats_100 = get_stats(100, fmt_name)
     if stats_100 is None:
         return None
     
     s100, z100, d100 = stats_100
-    if s100 < target_ssim:
-        return {'path_data': d100, 'size': z100, 'score': s100, 'ext': ext, 'q': 100}
 
-    low, high = 11, 99
-    best_res = {'path_data': d100, 'size': z100, 'score': s100, 'ext': ext, 'q': 100}
+    # 3. Standard Search (if Q=100 already meets target)
+    if s100 >= target_ssim:
+        low, high = 11, 99
+        best_res = {'path_data': d100, 'size': z100, 'score': s100, 'ext': ext, 'q_label': '100'}
+        
+        while low <= high:
+            mid = (low + high) // 2
+            res = get_stats(mid, fmt_name)
+            if res and res[0] >= target_ssim:
+                best_res = {'path_data': res[2], 'size': res[1], 'score': res[0], 'ext': ext, 'q_label': str(mid)}
+                high = mid - 1
+            else:
+                low = mid + 1
+        return best_res
 
-    while low <= high:
-        mid = (low + high) // 2
-        res = get_stats(mid)
-        if res and res[0] >= target_ssim:
-            best_res = {'path_data': res[2], 'size': res[1], 'score': res[0], 'ext': ext, 'q': mid}
-            high = mid - 1
-        else:
-            low = mid + 1
-            
-    return best_res
+    # 4. "Last Resort" Check (Q=100 failed to hit target SSIM)
+    last_resorts = []
+    
+    # Option A: WebP Lossless
+    res_w_l = get_stats(100, 'WEBP', is_lossless=True)
+    if res_w_l and res_w_l[0] >= target_ssim and res_w_l[1] < orig_size:
+        last_resorts.append({'path_data': res_w_l[2], 'size': res_w_l[1], 'score': res_w_l[0], 'ext': 'webp', 'q_label': 'lossless'})
+    
+    # Option B: AVIF 4:4:4
+    res_a_444 = get_stats(100, 'AVIF', subsampling_val="4:4:4")
+    if res_a_444 and res_a_444[0] >= target_ssim and res_a_444[1] < orig_size:
+        last_resorts.append({'path_data': res_a_444[2], 'size': res_a_444[1], 'score': res_a_444[0], 'ext': 'avif', 'q_label': '100 [4:4:4]'})
 
-def process_single_file_worker(file_path, rel_path, tmp_work_p, target_ssim, requested_format=None):
+    if last_resorts:
+        # 最もサイズが小さいものを選択
+        best_last = min(last_resorts, key=lambda x: x['size'])
+        return best_last
+
+    # 5. Fallback: Q=100 (Standard)
+    return {'path_data': d100, 'size': z100, 'score': s100, 'ext': ext, 'q_label': '100'}
+
+def process_single_file_worker(file_path, rel_path, tmp_work_p, target_ssim, orig_size, requested_format=None):
     try:
         file_path = Path(file_path)
         rel_path = Path(rel_path)
         orig_img = Image.open(file_path)
         if orig_img.mode not in ("RGB", "L"):
             orig_img = orig_img.convert("RGB")
-        orig_size = file_path.stat().st_size
         
         candidates = []
         formats_to_test = [requested_format.upper()] if requested_format else ['WEBP', 'AVIF']
 
         for fmt in formats_to_test:
-            res = get_best_quality_for_format_logic(orig_img, fmt, target_ssim)
+            res = get_best_quality_for_format_logic(orig_img, fmt, target_ssim, orig_size)
             if res and res['size'] < orig_size:
                 candidates.append(res)
 
@@ -150,7 +174,8 @@ def process_single_file_worker(file_path, rel_path, tmp_work_p, target_ssim, req
             f.write(best['path_data'])
             
         reduction = ((orig_size - best['size']) / orig_size) * 100
-        return ("INFO", f"OK: {rel_path} -> {best['ext'].upper()} (Q={best['q']}, Size: {best['size']} bytes, SSIM={best['score']:.1f}, Reduction: {reduction:.2f}%)")
+        # Q=q_label を使用してログ出力
+        return ("INFO", f"OK: {rel_path} -> {best['ext'].upper()} (Q={best['q_label']}, Size: {best['size']} bytes, SSIM={best['score']:.1f}, Reduction: {reduction:.2f}%)")
 
     except Exception as e:
         try:
@@ -218,9 +243,10 @@ class Converter:
                 for f in all_files:
                     rel = f.relative_to(tmp_extract_p)
                     if f.suffix.lower() in IMAGE_EXTENSIONS:
+                        orig_size = f.stat().st_size
                         futures.append(executor.submit(
                             process_single_file_worker, 
-                            str(f), str(rel), tmp_work_p_str, self.target_ssim, self.requested_format
+                            str(f), str(rel), tmp_work_p_str, self.target_ssim, orig_size, self.requested_format
                         ))
                     else:
                         dest = tmp_work_p / rel
