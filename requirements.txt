@@ -3,5 +3,6 @@ py7zr
 Pillow
 tqdm
 scikit-image
+lazy-loader>=0.6
 numpy
-nuitka
+nuitka>=4.2.2
