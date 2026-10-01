@@ -26,6 +26,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m pip install --upgrade Nuitka
+
+      - name: Nuitkaのバージョン確認
+        run: |
+          python -m nuitka --version
+          python -c "import lazy_loader; print(lazy_loader.__file__); print(getattr(lazy_loader, '__version__', 'unknown')); print(hasattr(lazy_loader, '_StubVisitor'))"
 
       - name: バージョン設定
         shell: pwsh
