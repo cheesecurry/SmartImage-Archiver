@@ -150,6 +150,12 @@ def process_single_file_worker(file_path, rel_path, tmp_work_p, target_ssim, ori
         orig_img = Image.open(file_path)
         if orig_img.mode not in ("RGB", "L"):
             orig_img = orig_img.convert("RGB")
+
+        # 中身がグレイスケール（RGB）なら 'L' モードに変換
+        if orig_img.mode == "RGB":
+            img_arr = np.asarray(orig_img)
+            if np.max(np.max(img_arr, axis=2) - np.min(img_arr, axis=2)) <= 10:
+                orig_img = orig_img.convert("L")
         
         candidates = []
         formats_to_test = [requested_format.upper()] if requested_format else ['WEBP', 'AVIF']
@@ -175,7 +181,7 @@ def process_single_file_worker(file_path, rel_path, tmp_work_p, target_ssim, ori
             
         reduction = ((orig_size - best['size']) / orig_size) * 100
         # Q=q_label を使用してログ出力
-        return ("INFO", f"OK: {rel_path} -> {best['ext'].upper()} (Q={best['q_label']}, Size: {best['size']} bytes, SSIM={best['score']:.1f}, Reduction: {reduction:.2f}%)")
+        return ("INFO", f"OK: {rel_path} -> {best['ext'].upper()} (Q={best['q_label']}, SSIM={best['score']:.1f}, Size: {orig_size} bytes -> {best['size']} bytes, Reduction: {reduction:.2f}%)")
 
     except Exception as e:
         try:
